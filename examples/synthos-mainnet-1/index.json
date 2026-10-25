@@ -1,0 +1,22 @@
+{
+  "schema": "cometbft-filecoin-archive/v1",
+  "chain_id": "synthos-mainnet-1",
+  "updated_at": "2026-10-25T22:25:02Z",
+  "ranges": [
+    {
+      "chain_id": "synthos-mainnet-1",
+      "start_height": 1,
+      "end_height": 100,
+      "block_count": 100,
+      "root_cid": "bafkreiggpkbmaq666uechyk42mr6puof3phdzdab5m424ug3zsze3j523u",
+      "car_file": "synthos-mainnet-1-000001-000100.car",
+      "car_sha256": "05b3e6fbd4551cff3ab233c204cea395512069af851c20808f121d072c5ca776",
+      "car_size_bytes": 252159,
+      "first_block_hash": "84396F133C4EC2BE2BB99280386151A8D1BB6CACA7AE559DF50B7FA25DE522E9",
+      "last_block_hash": "358A63955E55BC7F030913A595E576678F3DD83A03751FAD91BF71E1A58D4C9A",
+      "first_block_time": "2026-10-22T05:11:39.7806013Z",
+      "last_block_time": "2026-10-22T05:38:19.1580796Z",
+      "archived_at": "2026-10-25T22:25:02Z"
+    }
+  ]
+}
