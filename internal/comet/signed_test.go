@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.com/synthos-collective-group/cometbft-filecoin-archive/internal/car"
+	"github.com/elpresidentebutch-ctrl/cometbft-filecoin-archive/internal/car"
 )
 
 const exampleCAR = "../../examples/synthos-mainnet-1/synthos-mainnet-1-000001-000100.car"

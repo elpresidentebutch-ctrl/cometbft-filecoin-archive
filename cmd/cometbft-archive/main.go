@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.com/synthos-collective-group/cometbft-filecoin-archive/internal/archive"
-	"gitlab.com/synthos-collective-group/cometbft-filecoin-archive/internal/comet"
+	"github.com/elpresidentebutch-ctrl/cometbft-filecoin-archive/internal/archive"
+	"github.com/elpresidentebutch-ctrl/cometbft-filecoin-archive/internal/comet"
 )
 
 func main() {

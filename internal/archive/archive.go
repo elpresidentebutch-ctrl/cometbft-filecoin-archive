@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.com/synthos-collective-group/cometbft-filecoin-archive/internal/car"
-	"gitlab.com/synthos-collective-group/cometbft-filecoin-archive/internal/comet"
+	"github.com/elpresidentebutch-ctrl/cometbft-filecoin-archive/internal/car"
+	"github.com/elpresidentebutch-ctrl/cometbft-filecoin-archive/internal/comet"
 )
 
 // SchemaV1 identifies v1 archives: the manifest plus the blocks.
