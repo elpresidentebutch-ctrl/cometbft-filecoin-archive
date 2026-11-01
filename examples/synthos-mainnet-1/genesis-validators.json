@@ -1,0 +1,21 @@
+{
+  "chain_id": "synthos-mainnet-1",
+  "validators": [
+    {
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "tEybm7cpmLphGbSZX6E6MMM5ejbGq6zEFcRyBR7Okb4="
+      },
+      "power": "1000000",
+      "name": "hosteons-validator-1"
+    },
+    {
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "jJMGArhq1xdA3z6O3kySqKtr4fpAN8+Qu1aou3X2vKk="
+      },
+      "power": "1000000",
+      "name": "jim-pc-validator-1"
+    }
+  ]
+}

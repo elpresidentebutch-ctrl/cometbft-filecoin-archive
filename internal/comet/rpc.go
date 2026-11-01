@@ -198,6 +198,46 @@ func VerifyChainLinkage(blocks []*BlockRecord) error {
 	return nil
 }
 
+// FetchValidators returns the validator set at height H as one /validators
+// response with every page merged, so it can be stored and verified offline.
+func (c *Client) FetchValidators(ctx context.Context, height int64) ([]byte, error) {
+	const perPage = 100
+	var all []json.RawMessage
+	for page := 1; ; page++ {
+		raw, err := c.get(ctx, fmt.Sprintf("/validators?height=%d&page=%d&per_page=%d", height, page, perPage))
+		if err != nil {
+			return nil, err
+		}
+		var env struct {
+			Result struct {
+				Validators []json.RawMessage `json:"validators"`
+				Total      string            `json:"total"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return nil, fmt.Errorf("comet: decode /validators: %w", err)
+		}
+		all = append(all, env.Result.Validators...)
+		total, err := strconv.Atoi(env.Result.Total)
+		if err != nil {
+			return nil, fmt.Errorf("comet: /validators total %q: %w", env.Result.Total, err)
+		}
+		if len(all) >= total || len(env.Result.Validators) == 0 {
+			break
+		}
+	}
+	return json.Marshal(map[string]any{"result": map[string]any{
+		"block_height": strconv.FormatInt(height, 10),
+		"validators":   all,
+		"total":        strconv.Itoa(len(all)),
+	}})
+}
+
+// FetchCommit returns the /commit response (signed header) for height H.
+func (c *Client) FetchCommit(ctx context.Context, height int64) ([]byte, error) {
+	return c.get(ctx, fmt.Sprintf("/commit?height=%d", height))
+}
+
 func (c *Client) get(ctx context.Context, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
 	if err != nil {

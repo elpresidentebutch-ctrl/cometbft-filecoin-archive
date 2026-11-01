@@ -8,11 +8,13 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gitlab.com/synthos-collective-group/cometbft-filecoin-archive/internal/archive"
@@ -56,7 +58,7 @@ func usage() {
 
 Usage:
   cometbft-archive archive --rpc <url> --from <height> --to <height> [--out ./archives] [--index ./archives/index.json]
-  cometbft-archive verify  --car <path.car> [--rpc <url>]
+  cometbft-archive verify  --car <path.car> [--genesis genesis.json | --trusted-validators-hash HEX] [--strict] [--rpc <url>]
   cometbft-archive restore --car <path.car> --out <dir>
   cometbft-archive inspect --car <path.car>
 `)
@@ -91,21 +93,24 @@ func runVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	carPath := fs.String("car", "", "path to .car file to verify")
 	rpcURL := fs.String("rpc", "", "optional CometBFT RPC endpoint to cross-check boundary hashes")
+	genesisPath := fs.String("genesis", "", "the chain's CometBFT genesis.json: trust its validator set as the anchor for signature checks")
+	trustedHash := fs.String("trusted-validators-hash", "", "hex validators_hash you trust as the anchor (for ranges that don't start at genesis)")
+	strict := fs.Bool("strict", false, "fail unless every block's signatures were checked against an anchored validator set")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *carPath == "" {
 		return fmt.Errorf("--car is required")
 	}
+	opts, err := verifyOptions(*rpcURL, *genesisPath, *trustedHash, *strict)
+	if err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	var client *comet.Client
-	if *rpcURL != "" {
-		client = comet.NewClient(*rpcURL)
-	}
-	report, _, _, err := archive.VerifyCARFile(ctx, *carPath, client)
+	report, _, _, err := archive.VerifyCARFile(ctx, *carPath, opts)
 	if err != nil {
 		return err
 	}
@@ -131,8 +136,8 @@ func runRestore(args []string) error {
 		return err
 	}
 	return printJSON(map[string]any{
-		"ok":          true,
-		"restored_to": *outDir,
+		"ok":           true,
+		"restored_to":  *outDir,
 		"verification": report,
 	})
 }
@@ -150,11 +155,38 @@ func runInspect(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	_, _, manifest, err := archive.VerifyCARFile(ctx, *carPath, nil)
+	_, _, manifest, err := archive.VerifyCARFile(ctx, *carPath, archive.VerifyOptions{})
 	if err != nil {
 		return err
 	}
 	return printJSON(manifest)
+}
+
+// verifyOptions builds verification options from the verify command's flags.
+func verifyOptions(rpcURL, genesisPath, trustedHash string, strict bool) (archive.VerifyOptions, error) {
+	opts := archive.VerifyOptions{Strict: strict}
+	if rpcURL != "" {
+		opts.Client = comet.NewClient(rpcURL)
+	}
+	if genesisPath != "" {
+		raw, err := os.ReadFile(genesisPath)
+		if err != nil {
+			return opts, fmt.Errorf("--genesis: %w", err)
+		}
+		chainID, vs, err := comet.ParseGenesisValidators(raw)
+		if err != nil {
+			return opts, fmt.Errorf("--genesis: %w", err)
+		}
+		opts.GenesisChainID, opts.GenesisValidators = chainID, vs
+	}
+	if trustedHash != "" {
+		b, err := hex.DecodeString(strings.TrimPrefix(strings.TrimSpace(trustedHash), "0x"))
+		if err != nil || len(b) != 32 {
+			return opts, fmt.Errorf("--trusted-validators-hash must be 32 bytes of hex")
+		}
+		opts.TrustedValidatorsHash = b
+	}
+	return opts, nil
 }
 
 func printJSON(v any) error {

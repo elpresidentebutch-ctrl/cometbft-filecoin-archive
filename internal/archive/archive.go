@@ -23,9 +23,13 @@ import (
 	"gitlab.com/synthos-collective-group/cometbft-filecoin-archive/internal/comet"
 )
 
-// SchemaV1 identifies the v1 range manifest schema embedded as the root block
-// of each CARv1 archive.
+// SchemaV1 identifies v1 archives: the manifest plus the blocks.
 const SchemaV1 = "cometbft-filecoin-archive/v1"
+
+// SchemaV2 archives also carry what is needed to check validator signatures
+// offline: the validator set behind every validators_hash in the range and
+// the commit for the last block.
+const SchemaV2 = "cometbft-filecoin-archive/v2"
 
 // BlockDescriptor summarizes a single CometBFT block inside a RangeManifest.
 type BlockDescriptor struct {
@@ -52,6 +56,32 @@ type RangeManifest struct {
 	FirstBlockTime string            `json:"first_block_time"`
 	LastBlockTime  string            `json:"last_block_time"`
 	Blocks         []BlockDescriptor `json:"blocks"`
+	// v2 only.
+	ValidatorSets []ArtifactRef `json:"validator_sets,omitempty"`
+	FinalCommit   *ArtifactRef  `json:"final_commit,omitempty"`
+}
+
+// ArtifactRef points at an extra CAR block: a /validators response (Hash is
+// the validators_hash it must produce) or the /commit for the last height.
+type ArtifactRef struct {
+	Height int64  `json:"height"`
+	Hash   string `json:"hash,omitempty"`
+	CID    string `json:"cid"`
+}
+
+// Extras is the signature-checking material packed into a v2 archive.
+type Extras struct {
+	// ValidatorSets maps an upper-case validators_hash to a merged
+	// /validators response and the height it was fetched at.
+	ValidatorSets map[string]FetchedValidators
+	// FinalCommit is the /commit response for the last height in the range.
+	FinalCommit []byte
+}
+
+// FetchedValidators is a /validators response and the height it describes.
+type FetchedValidators struct {
+	Height int64
+	Raw    []byte
 }
 
 // IndexEntry maps a block height range to its CARv1 root CID, file metadata,
@@ -83,11 +113,22 @@ type IndexFile struct {
 }
 
 // PackBlocks builds a deterministic CARv1 byte stream from an ordered slice of
-// verified CometBFT BlockRecords and returns the CAR bytes, the root CID, and
-// the RangeManifest.
-func PackBlocks(records []*comet.BlockRecord) ([]byte, car.CID, *RangeManifest, error) {
+// CometBFT blocks and returns the CAR bytes, the root CID, and the
+// RangeManifest. Every block's hashes are recomputed first. With extras it
+// writes a v2 archive that can be signature-checked offline; with nil
+// extras, a v1 archive.
+func PackBlocks(records []*comet.BlockRecord, extras *Extras) ([]byte, car.CID, *RangeManifest, error) {
 	if err := comet.VerifyChainLinkage(records); err != nil {
 		return nil, car.CID{}, nil, err
+	}
+	for _, rec := range records {
+		fb, err := comet.ParseFullBlock(rec.RawJSON)
+		if err != nil {
+			return nil, car.CID{}, nil, fmt.Errorf("archive: height %d: %w", rec.Height, err)
+		}
+		if err := fb.Check(); err != nil {
+			return nil, car.CID{}, nil, fmt.Errorf("archive: %w", err)
+		}
 	}
 
 	descriptors := make([]BlockDescriptor, 0, len(records))
@@ -126,6 +167,26 @@ func PackBlocks(records []*comet.BlockRecord) ([]byte, car.CID, *RangeManifest, 
 		Blocks:         descriptors,
 	}
 
+	if extras != nil {
+		manifest.Schema = SchemaV2
+		hashes := make([]string, 0, len(extras.ValidatorSets))
+		for h := range extras.ValidatorSets {
+			hashes = append(hashes, h)
+		}
+		sort.Strings(hashes)
+		for _, h := range hashes {
+			fv := extras.ValidatorSets[h]
+			cid := car.NewCID(car.CodecRaw, fv.Raw)
+			manifest.ValidatorSets = append(manifest.ValidatorSets, ArtifactRef{Height: fv.Height, Hash: h, CID: cid.String()})
+			ipldBlocks = append(ipldBlocks, car.Block{CID: cid, Data: fv.Raw})
+		}
+		if len(extras.FinalCommit) > 0 {
+			cid := car.NewCID(car.CodecRaw, extras.FinalCommit)
+			manifest.FinalCommit = &ArtifactRef{Height: last.Height, CID: cid.String()}
+			ipldBlocks = append(ipldBlocks, car.Block{CID: cid, Data: extras.FinalCommit})
+		}
+	}
+
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return nil, car.CID{}, nil, fmt.Errorf("archive: marshal manifest: %w", err)
@@ -154,6 +215,7 @@ func ArchiveRange(ctx context.Context, client *comet.Client, fromHeight, toHeigh
 	if fromHeight <= 0 || toHeight < fromHeight {
 		return nil, fmt.Errorf("archive: invalid height range %d..%d", fromHeight, toHeight)
 	}
+	var err error
 	records := make([]*comet.BlockRecord, 0, toHeight-fromHeight+1)
 	for h := fromHeight; h <= toHeight; h++ {
 		rec, err := client.FetchBlock(ctx, h)
@@ -163,7 +225,32 @@ func ArchiveRange(ctx context.Context, client *comet.Client, fromHeight, toHeigh
 		records = append(records, rec)
 	}
 
-	carBytes, rootCID, manifest, err := PackBlocks(records)
+	// Fetch the validator set behind each validators_hash in the range, and
+	// the commit that finalizes the last block, so signatures can be
+	// checked later without a live node.
+	extras := &Extras{ValidatorSets: map[string]FetchedValidators{}}
+	for _, rec := range records {
+		if _, ok := extras.ValidatorSets[rec.ValidatorsHash]; ok {
+			continue
+		}
+		raw, err := client.FetchValidators(ctx, rec.Height)
+		if err != nil {
+			return nil, fmt.Errorf("archive: validators at height %d: %w", rec.Height, err)
+		}
+		vs, err := comet.ParseValidators(raw)
+		if err != nil {
+			return nil, fmt.Errorf("archive: validators at height %d: %w", rec.Height, err)
+		}
+		if got := fmt.Sprintf("%X", vs.Hash()); got != rec.ValidatorsHash {
+			return nil, fmt.Errorf("archive: validators at height %d hash to %s, header says %s", rec.Height, got, rec.ValidatorsHash)
+		}
+		extras.ValidatorSets[rec.ValidatorsHash] = FetchedValidators{Height: rec.Height, Raw: raw}
+	}
+	if extras.FinalCommit, err = client.FetchCommit(ctx, toHeight); err != nil {
+		return nil, fmt.Errorf("archive: commit for height %d: %w", toHeight, err)
+	}
+
+	carBytes, rootCID, manifest, err := PackBlocks(records, extras)
 	if err != nil {
 		return nil, err
 	}
@@ -243,6 +330,7 @@ func UpsertIndex(indexPath string, entry IndexEntry) error {
 // VerificationReport summarizes the result of verifying a CARv1 archive.
 type VerificationReport struct {
 	CARPath              string `json:"car_path"`
+	Schema               string `json:"schema"`
 	RootCID              string `json:"root_cid"`
 	ChainID              string `json:"chain_id"`
 	StartHeight          int64  `json:"start_height"`
@@ -252,15 +340,46 @@ type VerificationReport struct {
 	LastBlockHash        string `json:"last_block_hash"`
 	CIDIntegrityValid    bool   `json:"cid_integrity_valid"`
 	ParentHashChainValid bool   `json:"parent_hash_chain_valid"`
-	LiveNodeMatched      bool   `json:"live_node_matched,omitempty"`
+	// HeaderHashesValid: every block hash, data_hash and last_commit_hash
+	// was recomputed from the block's own contents and matched.
+	HeaderHashesValid bool `json:"header_hashes_valid"`
+	// CommitsVerified counts blocks whose finalizing commit carried valid
+	// signatures from more than 2/3 of their validator set's voting power.
+	CommitsVerified int `json:"commits_verified"`
+	// AllCommitsVerified is true when every block in the range was checked.
+	AllCommitsVerified bool `json:"all_commits_verified"`
+	// ValidatorSetAnchored is true when the validator sets used trace back,
+	// through signed headers, to a set you supplied (--genesis or
+	// --trusted-validators-hash). Without it, the signatures only prove the
+	// archive is internally consistent, not that it is the real chain.
+	ValidatorSetAnchored bool     `json:"validator_set_anchored"`
+	TrustAnchor          string   `json:"trust_anchor,omitempty"`
+	LiveNodeMatched      bool     `json:"live_node_matched,omitempty"`
+	Warnings             []string `json:"warnings,omitempty"`
 }
 
-// VerifyCARFile reads a CARv1 archive from disk, verifies every IPLD block's
-// SHA-256 multihash CID, validates the root RangeManifest against the enclosed
-// CometBFT blocks, checks parent-hash linkage across the entire height range,
-// and (if client != nil) verifies the boundary block hashes against a live
-// CometBFT RPC node.
-func VerifyCARFile(ctx context.Context, carPath string, client *comet.Client) (*VerificationReport, []*comet.BlockRecord, *RangeManifest, error) {
+// VerifyOptions controls how far VerifyCARFile goes.
+type VerifyOptions struct {
+	// Client, when set, cross-checks the boundary block hashes with a live node.
+	Client *comet.Client
+	// GenesisChainID and GenesisValidators trust the chain's genesis
+	// validator set (parsed from a CometBFT genesis.json).
+	GenesisChainID    string
+	GenesisValidators *comet.ValidatorSet
+	// TrustedValidatorsHash trusts a validator set by its hash.
+	TrustedValidatorsHash []byte
+	// Strict fails verification unless every block's commit was checked
+	// against an anchored validator set.
+	Strict bool
+}
+
+// VerifyCARFile reads a CARv1 archive and verifies it without trusting its
+// producer: every IPLD block's CID; the manifest; every block hash,
+// data_hash and last_commit_hash recomputed from the block contents; the
+// parent-hash chain; and, where a validator set is available, the validator
+// signatures that finalized each block. Options add a trust anchor for the
+// validator set and a live-node cross-check.
+func VerifyCARFile(ctx context.Context, carPath string, opts VerifyOptions) (*VerificationReport, []*comet.BlockRecord, *RangeManifest, error) {
 	f, err := os.Open(carPath)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("verify: open %s: %w", carPath, err)
@@ -286,15 +405,24 @@ func VerifyCARFile(ctx context.Context, carPath string, client *comet.Client) (*
 	if err := json.Unmarshal(blocks[0].Data, &manifest); err != nil {
 		return nil, nil, nil, fmt.Errorf("verify: unmarshal root manifest: %w", err)
 	}
-	if manifest.Schema != SchemaV1 {
+	if manifest.Schema != SchemaV1 && manifest.Schema != SchemaV2 {
 		return nil, nil, nil, fmt.Errorf("verify: unsupported manifest schema %q", manifest.Schema)
 	}
-	chainBlocks := blocks[1:]
-	if len(chainBlocks) != len(manifest.Blocks) || len(chainBlocks) != manifest.BlockCount {
-		return nil, nil, nil, fmt.Errorf("verify: block count mismatch: CAR has %d chain blocks, manifest declares %d", len(chainBlocks), manifest.BlockCount)
+	extraCount := len(manifest.ValidatorSets)
+	if manifest.FinalCommit != nil {
+		extraCount++
 	}
+	if manifest.Schema == SchemaV1 && extraCount > 0 {
+		return nil, nil, nil, fmt.Errorf("verify: v1 manifest lists v2 artifacts")
+	}
+	if len(manifest.Blocks) != manifest.BlockCount || len(blocks)-1 != manifest.BlockCount+extraCount {
+		return nil, nil, nil, fmt.Errorf("verify: block count mismatch: CAR has %d blocks after the manifest, manifest declares %d chain blocks + %d extras", len(blocks)-1, manifest.BlockCount, extraCount)
+	}
+	chainBlocks := blocks[1 : 1+manifest.BlockCount]
+	extraBlocks := blocks[1+manifest.BlockCount:]
 
 	records := make([]*comet.BlockRecord, 0, len(chainBlocks))
+	full := make([]*comet.FullBlock, 0, len(chainBlocks))
 	for i, blk := range chainBlocks {
 		desc := manifest.Blocks[i]
 		if blk.CID.String() != desc.CID {
@@ -307,15 +435,30 @@ func VerifyCARFile(ctx context.Context, carPath string, client *comet.Client) (*
 		if rec.Height != desc.Height || !strings.EqualFold(rec.BlockHash, desc.BlockHash) {
 			return nil, nil, nil, fmt.Errorf("verify: block %d header mismatch against manifest descriptor", i)
 		}
+		fb, err := comet.ParseFullBlock(blk.Data)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("verify: height %d: %w", rec.Height, err)
+		}
+		// The hash a block claims is only trusted once it is recomputed
+		// from the header; otherwise a forged chain with made-up hashes
+		// that point at each other would pass.
+		if err := fb.Check(); err != nil {
+			return nil, nil, nil, fmt.Errorf("verify: %w", err)
+		}
 		records = append(records, rec)
+		full = append(full, fb)
 	}
-
 	if err := comet.VerifyChainLinkage(records); err != nil {
 		return nil, nil, nil, err
+	}
+	if records[0].ChainID != manifest.ChainID || records[0].Height != manifest.StartHeight || records[len(records)-1].Height != manifest.EndHeight ||
+		!strings.EqualFold(records[0].BlockHash, manifest.FirstBlockHash) || !strings.EqualFold(records[len(records)-1].BlockHash, manifest.LastBlockHash) {
+		return nil, nil, nil, fmt.Errorf("verify: manifest summary does not match the blocks it contains")
 	}
 
 	report := &VerificationReport{
 		CARPath:              carPath,
+		Schema:               manifest.Schema,
 		RootCID:              rootCID.String(),
 		ChainID:              manifest.ChainID,
 		StartHeight:          manifest.StartHeight,
@@ -325,14 +468,116 @@ func VerifyCARFile(ctx context.Context, carPath string, client *comet.Client) (*
 		LastBlockHash:        manifest.LastBlockHash,
 		CIDIntegrityValid:    true,
 		ParentHashChainValid: true,
+		HeaderHashesValid:    true,
 	}
 
-	if client != nil {
-		firstLive, err := client.FetchBlock(ctx, manifest.StartHeight)
+	// Signature-checking material: validator sets carried by a v2 archive
+	// (each must hash to the validators_hash it claims) and/or supplied by
+	// the caller.
+	valsets := map[string]*comet.ValidatorSet{}
+	for i, ref := range manifest.ValidatorSets {
+		blk := extraBlocks[i]
+		if blk.CID.String() != ref.CID {
+			return nil, nil, nil, fmt.Errorf("verify: validator set %d CID mismatch", i)
+		}
+		vs, err := comet.ParseValidators(blk.Data)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("verify: validator set at height %d: %w", ref.Height, err)
+		}
+		got := fmt.Sprintf("%X", vs.Hash())
+		if !strings.EqualFold(got, ref.Hash) {
+			return nil, nil, nil, fmt.Errorf("verify: validator set at height %d hashes to %s, manifest says %s", ref.Height, got, ref.Hash)
+		}
+		valsets[got] = vs
+	}
+	var finalCommit *comet.Commit
+	if ref := manifest.FinalCommit; ref != nil {
+		blk := extraBlocks[len(extraBlocks)-1]
+		if blk.CID.String() != ref.CID {
+			return nil, nil, nil, fmt.Errorf("verify: final commit CID mismatch")
+		}
+		h, c, err := comet.ParseSignedHeader(blk.Data)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("verify: final commit: %w", err)
+		}
+		if last := full[len(full)-1]; fmt.Sprintf("%X", h.Hash()) != fmt.Sprintf("%X", last.BlockID.Hash) {
+			return nil, nil, nil, fmt.Errorf("verify: final commit's header does not match block %d", last.Header.Height)
+		}
+		finalCommit = c
+	}
+	trusted := map[string]string{}
+	if opts.GenesisValidators != nil {
+		if opts.GenesisChainID != "" && opts.GenesisChainID != manifest.ChainID {
+			return nil, nil, nil, fmt.Errorf("verify: genesis is for chain %q, archive is %q", opts.GenesisChainID, manifest.ChainID)
+		}
+		h := fmt.Sprintf("%X", opts.GenesisValidators.Hash())
+		valsets[h] = opts.GenesisValidators
+		trusted[h] = "genesis validator set"
+	}
+	if len(opts.TrustedValidatorsHash) > 0 {
+		trusted[fmt.Sprintf("%X", opts.TrustedValidatorsHash)] = "trusted validators hash"
+	}
+
+	// Walk the range like a light client: a block is anchored when its
+	// validator set is trusted, or when the previous, already-verified
+	// header committed to that set as its next_validators_hash.
+	anchored := len(full) > 0
+	prevAnchored := false
+	unchecked := 0
+	for i, b := range full {
+		h := b.Header.Height
+		vh := fmt.Sprintf("%X", b.Header.ValidatorsHash)
+		vs := valsets[vh]
+		if vs == nil {
+			unchecked++
+			prevAnchored = false
+			continue
+		}
+		var commit *comet.Commit
+		if i+1 < len(full) {
+			commit = full[i+1].LastCommit
+		} else {
+			commit = finalCommit
+		}
+		if commit == nil || len(commit.Signatures) == 0 {
+			unchecked++
+			prevAnchored = false
+			continue
+		}
+		if err := comet.VerifyCommit(manifest.ChainID, vs, b.BlockID, h, commit); err != nil {
+			return nil, nil, nil, fmt.Errorf("verify: %w", err)
+		}
+		report.CommitsVerified++
+		here := false
+		if src, ok := trusted[vh]; ok {
+			here = true
+			if report.TrustAnchor == "" {
+				report.TrustAnchor = fmt.Sprintf("%s at height %d", src, h)
+			}
+		} else if i > 0 && prevAnchored && strings.EqualFold(fmt.Sprintf("%X", full[i-1].Header.NextValidatorsHash), vh) {
+			here = true
+		}
+		prevAnchored = here
+		anchored = anchored && here
+	}
+	report.AllCommitsVerified = unchecked == 0
+	report.ValidatorSetAnchored = anchored && report.CommitsVerified > 0
+	if unchecked > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d of %d blocks' signatures were not checked: their validator set or finalizing commit is not in this archive (v1 archives need --genesis; the last block of a v1 archive has no commit)", unchecked, len(full)))
+	}
+	if !report.ValidatorSetAnchored && report.CommitsVerified > 0 {
+		report.Warnings = append(report.Warnings, "signatures are valid, but the validator set is not anchored to one you trust; pass --genesis <genesis.json> or --trusted-validators-hash to prove this is the real chain")
+	}
+	if opts.Strict && (!report.AllCommitsVerified || !report.ValidatorSetAnchored) {
+		return nil, nil, nil, fmt.Errorf("verify: --strict: %s", strings.Join(report.Warnings, "; "))
+	}
+
+	if opts.Client != nil {
+		firstLive, err := opts.Client.FetchBlock(ctx, manifest.StartHeight)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("verify against live node (height %d): %w", manifest.StartHeight, err)
 		}
-		lastLive, err := client.FetchBlock(ctx, manifest.EndHeight)
+		lastLive, err := opts.Client.FetchBlock(ctx, manifest.EndHeight)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("verify against live node (height %d): %w", manifest.EndHeight, err)
 		}
@@ -351,7 +596,7 @@ func VerifyCARFile(ctx context.Context, carPath string, client *comet.Client) (*
 // RestoreCARFile verifies a CARv1 archive and writes its verified CometBFT
 // block JSON payloads and range manifest to outDir.
 func RestoreCARFile(ctx context.Context, carPath, outDir string) (*VerificationReport, error) {
-	report, records, manifest, err := VerifyCARFile(ctx, carPath, nil)
+	report, records, manifest, err := VerifyCARFile(ctx, carPath, VerifyOptions{})
 	if err != nil {
 		return nil, err
 	}
