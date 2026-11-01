@@ -1,0 +1,18 @@
+# Build output
+/cometbft-archive
+/cometbft-archive.exe
+/dist/
+*.test
+*.out
+coverage.*
+
+# Local archive and restore runs (the committed examples/ stay tracked)
+/archives/
+/restored/
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

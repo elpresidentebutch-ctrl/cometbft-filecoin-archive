@@ -1,0 +1,10 @@
+# Same checks as .github/workflows/ci.yml, for the GitLab mirror.
+image: golang:1.22
+
+test:
+  script:
+    - test -z "$(gofmt -l .)"
+    - go vet ./...
+    - go test -race -count=1 -cover ./...
+    - go build ./cmd/cometbft-archive
+    - go run ./cmd/cometbft-archive verify --car examples/synthos-mainnet-1/synthos-mainnet-1-000001-000100.car --genesis examples/synthos-mainnet-1/genesis-validators.json
